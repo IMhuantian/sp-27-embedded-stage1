@@ -45,14 +45,6 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
-    applications/plotter_task.cpp
-    sp_middleware/io/plotter/plotter.cpp
-
-    applications/can_task.cpp # <- 添加这一行
-    sp_middleware/io/can/can.cpp # <- 添加这一行
-    sp_middleware/motor/rm_motor/rm_motor.cpp # <- 添加这一行
-
-    # ---- 第一阶段: C板基本功能 ----
     applications/led_task.cpp
     sp_middleware/io/led/led.cpp
 
@@ -66,6 +58,14 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 
     applications/uart_task.cpp
     sp_middleware/io/dbus/dbus.cpp
+
+    applications/plotter_task.cpp
+    sp_middleware/io/plotter/plotter.cpp
+
+    applications/can_task.cpp
+    sp_middleware/io/can/can.cpp
+    sp_middleware/motor/rm_motor/rm_motor.cpp
+    sp_middleware/tools/pid/pid.cpp
 )
 
 # Add include paths
