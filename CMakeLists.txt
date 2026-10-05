@@ -51,6 +51,21 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     applications/can_task.cpp # <- 添加这一行
     sp_middleware/io/can/can.cpp # <- 添加这一行
     sp_middleware/motor/rm_motor/rm_motor.cpp # <- 添加这一行
+
+    # ---- 第一阶段: C板基本功能 ----
+    applications/led_task.cpp
+    sp_middleware/io/led/led.cpp
+
+    applications/buzzer_task.cpp
+    sp_middleware/io/buzzer/buzzer.cpp
+
+    applications/imu_task.cpp
+    sp_middleware/io/bmi088/bmi088.cpp
+    sp_middleware/tools/mahony/mahony.cpp
+    sp_middleware/tools/math_tools/math_tools.cpp
+
+    applications/uart_task.cpp
+    sp_middleware/io/dbus/dbus.cpp
 )
 
 # Add include paths
