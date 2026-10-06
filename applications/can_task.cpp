@@ -16,6 +16,9 @@
  * 手动拖动电机的时候要重新算 psi0（见 linkage_step 里的拖动检测），
  * 这样拖完之后再转 C 板是从新位置继续跟，不会自己弹回原来的零位。
  *
+ * 右拨杆下档失能、上档复位。复位是把两台电机都开到和 C 板当前指向一致的位置，
+ * 三个箭头重新指同一个方向，到位后把那儿定成新的零位。
+ *
  * CAN 这边要注意：两台 GM6020 的 ID 都小于 5，控制帧 ID 都是 0x1FE，
  * 所以两条指令必须写进同一帧里、只 send 一次。
  */
@@ -81,6 +84,7 @@ struct LinkageState
 {
   bool inited = false;     // 上电标定做完了没有
   bool armed = false;      // 中档联动是不是已经对齐起点
+  bool reset_done = false; // 上档复位到位了没有
   float psi0_mech = 0.0f;  // 联动参考零点（机械角）
   float a0 = 0.0f;         // A 电机上电时的读数，也就是箭头对齐位
   float b0 = 0.0f;         // B 电机同上
@@ -128,15 +132,15 @@ void linkage_step()
 
   const uint32_t now = osKernelSysTick();
 
-  // 遥控器失联、或者电机还没上来数据，就一律失能。
-  // 另外 sp::DBus 的 sw_r/sw_l 在收到第一帧之前是没初始化的，也要靠这个挡掉
-  if (!remote.is_alive(now) || !motorA.is_open() || !motorB.is_open()) {
+  // 电机还没上来反馈数据，连零位都还没法定，一律失能
+  if (!motorA.is_open() || !motorB.is_open()) {
     motorA.cmd(0.0f);
     motorB.cmd(0.0f);
     pid_a.clear();
     pid_b.clear();
     g.inited = false;
     g.armed = false;
+    g.reset_done = false;
     linkage_ref_a = g.ref_a;
     linkage_ref_b = g.ref_b;
     linkage_phi_c = 0.0f;
@@ -144,7 +148,11 @@ void linkage_step()
     return;
   }
 
-  // 上电标定：把当前位置当成箭头对齐的机械零位
+  // 上电标定：把当前位置当成三个箭头对齐的机械零位。
+  // 这里只看电机——遥控器还没开机也要先把零位定下来，不然等你开遥控器的时候
+  // 电机可能已经被转到别的位置了，零位就跟着错。
+  // （sp::DBus 的 sw_r/sw_l 在收到第一帧之前是没初始化的，所以这块不碰它，
+  //   等遥控器上线后第一次换档检测会顺带清一遍状态）
   if (!g.inited) {
     g.inited = true;
     g.a0 = motorA.angle;
@@ -153,15 +161,32 @@ void linkage_step()
     g.ref_a = motorA.angle;
     g.ref_b = motorB.angle;
     g.armed = false;
-    g.last_sw_r = remote.sw_r;
+    g.reset_done = false;
     pid_a.clear();
     pid_b.clear();
+  }
+
+  // 遥控器失联就一律失能。零位留着不重标，遥控器重新连上以后切回中档
+  // 会以 A 的当前位置重新起算，不用再对一次箭头
+  if (!remote.is_alive(now)) {
+    motorA.cmd(0.0f);
+    motorB.cmd(0.0f);
+    pid_a.clear();
+    pid_b.clear();
+    g.armed = false;
+    g.reset_done = false;
+    linkage_ref_a = g.ref_a;
+    linkage_ref_b = g.ref_b;
+    linkage_phi_c = 0.0f;
+    linkage_k = 0.0f;
+    return;
   }
 
   // 右拨杆换档，清一下状态，免得残留积分和目标跳变
   if (remote.sw_r != g.last_sw_r) {
     g.last_sw_r = remote.sw_r;
     g.armed = false;
+    g.reset_done = false;
     pid_a.clear();
     pid_b.clear();
   }
@@ -180,19 +205,30 @@ void linkage_step()
     return;
   }
 
-  // 上档：复位，两台电机都回到上电对齐位，指向标箭头重新对上
+  // 上档：复位。两台电机都转到和 C 板当前指向一致的位置（这一下把比例当成 1:1），
+  // 三个箭头重新指同一个方向；到位以后把这里定成新的零位，切回中档从这儿接着走
   if (remote.sw_r == sp::DBusSwitchMode::UP) {
-    g.ref_a = slew(g.ref_a, g.a0, REF_RATE * PID_DT);
-    g.ref_b = slew(g.ref_b, g.b0, REF_RATE * PID_DT);
+    const float reset_phi_c = mech_yaw - g.psi0_mech;
+    const float target_a = g.a0 + A_DIR * reset_phi_c;
+    const float target_b = g.b0 + B_DIR * reset_phi_c;
+
+    g.ref_a = slew(g.ref_a, target_a, REF_RATE * PID_DT);
+    g.ref_b = slew(g.ref_b, target_b, REF_RATE * PID_DT);
 
     pid_a.calc(g.ref_a, motorA.angle);
     pid_b.calc(g.ref_b, motorB.angle);
     motorA.cmd(pid_a.out);
     motorB.cmd(pid_b.out);
 
-    // 都到位了就把 C 板当前朝向记成新的参考零点，这样切回中档是连着的
-    if (fabsf(motorA.angle - g.a0) < HOME_TOL && fabsf(motorB.angle - g.b0) < HOME_TOL) {
+    // 只锁一次：到位后把当前位置和朝向定成新的零位
+    if (!g.reset_done && fabsf(motorA.angle - target_a) < HOME_TOL &&
+        fabsf(motorB.angle - target_b) < HOME_TOL) {
+      g.reset_done = true;
+      g.a0 = motorA.angle;
+      g.b0 = motorB.angle;
       g.psi0_mech = mech_yaw;
+      g.ref_a = motorA.angle;
+      g.ref_b = motorB.angle;
     }
 
     linkage_ref_a = g.ref_a;
