@@ -7,7 +7,8 @@ RoboMaster 开发板 C 型（STM32F407IGHx）上的嵌入式工程。
 
 - 蜂鸣器提示音
 - RGB 流水灯（也能用来判断程序有没有堵塞）
-- IMU 数据采集 + Mahony 姿态解算，经串口打印到 SerialPlot
+- IMU 数据采集 + Mahony 姿态解算；三轴姿态角（roll / pitch / yaw）经串口打印到 SerialPlot
+  （USART1 / 921600 / 帧头 `AA BB`）
 - DT7 遥控器通讯
 - 两台 GM6020 的姿态与电机联动
 
@@ -109,15 +110,16 @@ source [find target/stm32f4x.cfg]
 三个旋转输入端是同轴的，统一用"绕 yaw 轴逆时针为正"的机械角来描述：
 
 ```
-phi_C = YAW_DIR * yaw - psi0           C 板
-phi_A = A_DIR * (motorA.angle - a0)    A 电机
-phi_B = B_DIR * (motorB.angle - b0)    B 电机
+phi_C = YAW_DIR * yaw - psi0               C 板
+phi_A = A_DIR * (motorA.angle - a0)        A 电机
+phi_B = B_DIR * (motorB.angle - b_ref0)    B 电机
 ```
 
-`a0` / `b0` 是上电时两台电机的读数，也就是三个指向标箭头对齐的位置。
+`a0` / `b0` 是上电时两台电机的读数，也就是三个指向标箭头对齐的位置；`b_ref0` 是 B 的比例基准，
+换左拨杆档位时会重钉一次，保证换比例本身不产生位移。
 
 右拨杆中档时按 `phi_A = phi_C`、`phi_B = k * phi_C` 联动，`k` 由左拨杆定（下档 +0.5、中档 -1、上档 +3），
-换算回电机角度就是 `ref_a = a0 + A_DIR * phi_C`、`ref_b = b0 + B_DIR * k * phi_C`，再交给位置环出力矩。
+换算回电机角度就是 `ref_a = a0 + A_DIR * phi_C`、`ref_b = b_ref0 + B_DIR * k * phi_C`，再交给位置环出力矩。
 
 手动拖动电机的时候，只要 C 板基本没动、而某个电机的位置偏差超过阈值，就认为它被手拖了。
 这时重算参考零点、并把那个电机的目标贴到它当前的位置上，所以不会有回正的力矩：
@@ -125,8 +127,7 @@ phi_B = B_DIR * (motorB.angle - b0)    B 电机
 - 拖 A：`psi0 = mech_yaw - phi_A`，零点跟着 A 走，然后 B 按 `k` 跟
 - 拖 B：`psi0 = mech_yaw - phi_B / k`，然后 A 按 `1/k` 跟
 
-因为 C 板本身没动，yaw 读数不变，而零点已经跟到新位置了，所以再转 C 板是从新位置继续联动，
-不会回原来的零位。
+再转 C 板是从新位置继续联动，不会回原来的零位。
 
 右拨杆三个档：下档发 0 电流让电机无力，中档联动，上档复位——两台电机都开到和 C 板当前
 指向一致的位置（这一下按 1:1 走），三个箭头重新指同一个方向，到位后把这儿定成新的零位，
@@ -151,12 +152,14 @@ phi_B = B_DIR * (motorB.angle - b0)    B 电机
 2. 新加 `applications/*.cpp` 之后，要在顶层 `CMakeLists.txt` 的 `target_sources` 里登记它自己
    **和它用到的 `sp_middleware` 源文件**；`cmake/stm32cubemx/CMakeLists.txt` 会被 CubeMX 重新生成，别往那里改
 3. `huart1` 上只能有一个 Plotter 发帧，两个任务同时发会交错成乱码，所以 IMU 的打印统一放在
-   `plotter_task` 里
+   `plotter_task` 里。SerialPlot 端：波特率 921600，Custom Frame / 帧头 `AA BB` / float /
+   Little Endian / 不勾 Checksum，Frame Size 选 First byte of the payload is size
+   （= 通道数 x 4，现在是 `0x0C`，一帧 15 字节）
 4. `imu_task.cpp` 里的 `r_ab` 是 BMI088 到机体系的旋转矩阵，板子装法变了就得改
 5. Mahony 的 `dt` 要跟实际调用周期一致（现在是 1ms）
 6. FreeRTOS 堆是 20000 字节，7 个任务的栈加起来大概 6KB，够用；再加任务的时候留意一下
 7. 两台 GM6020 的 ID 都小于 5，控制帧 ID 都是 `0x1FE`，两条指令必须写进同一帧再发
-8. 位置环的 `KI` 现在是 0：带积分的话手动拖动会积累积分量，松手会弹回去，跟"拖完不回零位"冲突
+8. 位置环的 `KI` 现在是 0：带积分的话手动拖动会积累积分量，松手会弹回去
 9. `sp_middleware` 是 submodule，提交前确认指针指向的版本是对的
 
 ## 还需要做的

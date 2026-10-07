@@ -7,20 +7,16 @@
  * 三个旋转输入端是同轴的，统一用"绕 yaw 轴逆时针为正"的机械角来描述：
  *     C板转角   phi_C = YAW_DIR * yaw - psi0
  *     A电机转角 phi_A = A_DIR * (motorA.angle - a0)
- *     B电机转角 phi_B = B_DIR * (motorB.angle - b0)
+ *     B电机转角 phi_B = B_DIR * (motorB.angle - b_ref0)
  *
  * 右拨杆中档时按下面的关系联动：
  *     phi_A = phi_C
  *     phi_B = k * phi_C        k 由左拨杆定：下档 +0.5、中档 -1、上档 +3
  *
- * 手动拖动电机的时候要重新算 psi0（见 linkage_step 里的拖动检测），
- * 这样拖完之后再转 C 板是从新位置继续跟，不会自己弹回原来的零位。
+ * 手动拖动电机时重算 psi0 或 b_ref0，拖完之后转 C 板从新位置继续跟，不会弹回原零位。
+ * 右拨杆下档失能、上档复位。
  *
- * 右拨杆下档失能、上档复位。复位是把两台电机都开到和 C 板当前指向一致的位置，
- * 三个箭头重新指同一个方向，到位后把那儿定成新的零位。
- *
- * CAN 这边要注意：两台 GM6020 的 ID 都小于 5，控制帧 ID 都是 0x1FE，
- * 所以两条指令必须写进同一帧里、只 send 一次。
+ * 两台 GM6020 的 ID 都小于 5，控制帧 ID 都是 0x1FE，两条指令要写进同一帧只 send 一次。
  */
 
 #include <cmath>
@@ -48,17 +44,21 @@ constexpr float K_LEFT_UP = +3.0f;
 // 位置环参数，输出单位 N·m（GM6020 上限大概 2.22 N·m）
 constexpr float PID_DT = 1e-3f;   // 控制周期 1ms，跟 osDelay(1) 对上
 constexpr float POS_KP = 1.2f;
-constexpr float POS_KI = 0.0f;    // 先用纯 PD，带积分的话手动拖动会让它松手回弹
+constexpr float POS_KI = 0.0f;    // 用纯 PD，带积分的话手动拖动会松手回弹
 constexpr float POS_KD = 0.03f;
 constexpr float POS_MAX_OUT = 1.0f;
 constexpr float POS_MAX_IOUT = 0.3f;
 constexpr float POS_ALPHA = 0.8f;  // D 项滤波系数，1 是不滤波
 
 // 拖动检测
-constexpr float DRAG_TOL = 0.20f;        // rad，位置误差超过它才当作是被手拖了
+constexpr float DRAG_TOL = 0.08f;        // rad，判为手拖的位置偏差阈值
+constexpr float DRAG_DECAY = 0.002f;     // rad，偏差每周期至少收敛这么多才算电机在追指令
+constexpr uint32_t DRAG_CONFIRM_MS = 20; // 偏差持续不收敛多久才判为手拖
+constexpr uint32_t DRAG_HOLD_MS = 500;   // 主导电机的保持时间
 constexpr float CBOARD_STILL = 0.0015f;  // rad/ms，一个周期内 C 板转这么少就算它没动
+constexpr uint32_t SW_DEBOUNCE_MS = 30;  // 拨杆换档消抖
 
-// 目标的斜率限幅，防止换档或者刚进联动的时候电机猛冲一下
+// 目标斜率限幅，避免换档或刚进联动时电机猛冲
 constexpr float REF_RATE = 5.0f;  // rad/s
 
 // 复位到位的判定
@@ -91,7 +91,18 @@ struct LinkageState
   float ref_a = 0.0f;      // A 的目标（motorA.angle 空间）
   float ref_b = 0.0f;
   float last_yaw = 0.0f;
+  float dev_a = 0.0f;      // A 上一周期的位置偏差
+  float dev_b = 0.0f;      // B 上一周期的位置偏差
+  uint32_t dev_ms = 0;     // 偏差开始不收敛的时刻
+  uint8_t leader = 0;      // 判定为被拖动的电机：0 无 / 1 A / 2 B
+  uint32_t leader_ms = 0;  // 主导电机的认定时刻
   sp::DBusSwitchMode last_sw_r = sp::DBusSwitchMode::DOWN;
+  sp::DBusSwitchMode pending_sw_r = sp::DBusSwitchMode::DOWN;  // 消抖候选档位
+  uint32_t sw_ms = 0;      // 候选档位出现的时刻
+  float b_ref0 = 0.0f;     // B 的比例基准：ref_b = b_ref0 + B_DIR*(k*phi_c)
+  sp::DBusSwitchMode last_sw_l = sp::DBusSwitchMode::MID;
+  sp::DBusSwitchMode pending_sw_l = sp::DBusSwitchMode::MID;
+  uint32_t sw_l_ms = 0;    // 左拨杆候选档位出现的时刻
 };
 
 LinkageState g;
@@ -122,7 +133,7 @@ float left_ratio(sp::DBusSwitchMode sw_l)
 
 // 相对上电对齐位的机械转角
 float phi_A() { return A_DIR * (motorA.angle - g.a0); }
-float phi_B() { return B_DIR * (motorB.angle - g.b0); }
+float phi_B() { return B_DIR * (motorB.angle - g.b_ref0); }
 
 void linkage_step()
 {
@@ -148,15 +159,12 @@ void linkage_step()
     return;
   }
 
-  // 上电标定：把当前位置当成三个箭头对齐的机械零位。
-  // 这里只看电机——遥控器还没开机也要先把零位定下来，不然等你开遥控器的时候
-  // 电机可能已经被转到别的位置了，零位就跟着错。
-  // （sp::DBus 的 sw_r/sw_l 在收到第一帧之前是没初始化的，所以这块不碰它，
-  //   等遥控器上线后第一次换档检测会顺带清一遍状态）
+  // 上电标定：把当前位置当成三个箭头对齐的机械零位。只看电机，不等遥控器
   if (!g.inited) {
     g.inited = true;
     g.a0 = motorA.angle;
     g.b0 = motorB.angle;
+    g.b_ref0 = motorB.angle;
     g.psi0_mech = mech_yaw;
     g.ref_a = motorA.angle;
     g.ref_b = motorB.angle;
@@ -166,8 +174,7 @@ void linkage_step()
     pid_b.clear();
   }
 
-  // 遥控器失联就一律失能。零位留着不重标，遥控器重新连上以后切回中档
-  // 会以 A 的当前位置重新起算，不用再对一次箭头
+  // 遥控器失联就一律失能，零位留着不重标
   if (!remote.is_alive(now)) {
     motorA.cmd(0.0f);
     motorB.cmd(0.0f);
@@ -182,21 +189,28 @@ void linkage_step()
     return;
   }
 
-  // 右拨杆换档，清一下状态，免得残留积分和目标跳变
-  if (remote.sw_r != g.last_sw_r) {
-    g.last_sw_r = remote.sw_r;
+  // 右拨杆换档消抖，新档位稳定 SW_DEBOUNCE_MS 后才切换；下面的分支都用消抖后的档位
+  if (remote.sw_r != g.pending_sw_r) {
+    g.pending_sw_r = remote.sw_r;
+    g.sw_ms = now;
+  } else if (g.pending_sw_r != g.last_sw_r && (now - g.sw_ms) > SW_DEBOUNCE_MS) {
+    g.last_sw_r = g.pending_sw_r;
     g.armed = false;
     g.reset_done = false;
+    g.dev_ms = now;
+    g.dev_a = 0.0f;
+    g.dev_b = 0.0f;
+    g.leader = 0;
     pid_a.clear();
     pid_b.clear();
   }
 
   const bool cboard_still = (fabsf(dyaw) < CBOARD_STILL);
-  const float k = left_ratio(remote.sw_l);
-  linkage_k = k;
+  // 比例用消抖后的档位
+  float k = left_ratio(g.last_sw_l);
 
-  // 下档：失能，显式发 0 电流，电机没力、可以随便用手转
-  if (remote.sw_r == sp::DBusSwitchMode::DOWN) {
+  // 下档：失能，发 0 电流
+  if (g.last_sw_r == sp::DBusSwitchMode::DOWN) {
     motorA.cmd(0.0f);
     motorB.cmd(0.0f);
     linkage_ref_a = g.ref_a;
@@ -205,9 +219,8 @@ void linkage_step()
     return;
   }
 
-  // 上档：复位。两台电机都转到和 C 板当前指向一致的位置（这一下把比例当成 1:1），
-  // 三个箭头重新指同一个方向；到位以后把这里定成新的零位，切回中档从这儿接着走
-  if (remote.sw_r == sp::DBusSwitchMode::UP) {
+  // 上档：复位。两台电机按 1:1 转到和 C 板当前指向一致的位置，三个箭头重新指同一个方向
+  if (g.last_sw_r == sp::DBusSwitchMode::UP) {
     const float reset_phi_c = mech_yaw - g.psi0_mech;
     const float target_a = g.a0 + A_DIR * reset_phi_c;
     const float target_b = g.b0 + B_DIR * reset_phi_c;
@@ -226,6 +239,7 @@ void linkage_step()
       g.reset_done = true;
       g.a0 = motorA.angle;
       g.b0 = motorB.angle;
+      g.b_ref0 = motorB.angle;
       g.psi0_mech = mech_yaw;
       g.ref_a = motorA.angle;
       g.ref_b = motorB.angle;
@@ -239,35 +253,93 @@ void linkage_step()
 
   // 中档：姿态与电机联动
   if (!g.armed) {
-    // 刚切进来，以 A 的当前位置为起点，避免切换瞬间冲一下
+    // 刚切进来，以 A 的当前位置为起点
     g.armed = true;
     g.psi0_mech = mech_yaw - phi_A();
     g.ref_a = motorA.angle;
     g.ref_b = motorB.angle;
+    g.dev_ms = now;
+    g.dev_a = 0.0f;
+    g.dev_b = 0.0f;
+    g.leader = 0;
+    // 进中档时对齐左拨杆，并把 B 的基准钉在当前角度上
+    g.last_sw_l = remote.sw_l;
+    g.pending_sw_l = remote.sw_l;
+    g.sw_l_ms = now;
+    g.b_ref0 = motorB.angle - B_DIR * (left_ratio(g.last_sw_l) * (mech_yaw - g.psi0_mech));
   }
 
+  // 左拨杆换档：k 变了要重钉 B 的基准，否则目标会随 k*phi_c 跳一次
+  if (remote.sw_l != g.pending_sw_l) {
+    g.pending_sw_l = remote.sw_l;
+    g.sw_l_ms = now;
+  } else if (g.pending_sw_l != g.last_sw_l && (now - g.sw_l_ms) > SW_DEBOUNCE_MS) {
+    g.last_sw_l = g.pending_sw_l;
+    k = left_ratio(g.last_sw_l);
+    const float phi_c_now = mech_yaw - g.psi0_mech;
+    g.b_ref0 = motorB.angle - B_DIR * (k * phi_c_now);
+    g.ref_b = motorB.angle;
+  }
+  linkage_k = k;
+
   // 拖动检测：只有 C 板基本没动的时候，电机的偏差才认为是手拖出来的。
-  // C 板自己在转的时候电机也会滞后，那种偏差不能当成拖动
+  // C 板自己在转的时候电机也会滞后，那种偏差不能当成拖动。
+  // 另外偏差要持续不收敛才算手拖，正常追指令时偏差很快收敛。
   if (cboard_still) {
     float phi_c = mech_yaw - g.psi0_mech;
+    const float dev_a = fabsf(g.a0 + A_DIR * phi_c - motorA.angle);
+    const float dev_b = fabsf(g.b_ref0 + B_DIR * k * phi_c - motorB.angle);
 
-    if (fabsf(g.a0 + A_DIR * phi_c - motorA.angle) > DRAG_TOL) {
-      // A 被拖了：参考零点跟着 A 的位置走，A 的目标直接贴到它现在的位置上
-      g.psi0_mech = mech_yaw - phi_A();
-      g.ref_a = motorA.angle;
-      phi_c = mech_yaw - g.psi0_mech;
+    // 偏差在收敛，重新计时
+    if (dev_a < g.dev_a - DRAG_DECAY || dev_b < g.dev_b - DRAG_DECAY) {
+      g.dev_ms = now;
     }
-    else if (fabsf(g.b0 + B_DIR * k * phi_c - motorB.angle) > DRAG_TOL) {
-      // B 被拖了：反过来由 B 的位置推零点，接着 A 会按 1/k 去跟
-      g.psi0_mech = mech_yaw - phi_B() / k;
-      g.ref_b = motorB.angle;
+    g.dev_a = dev_a;
+    g.dev_b = dev_b;
+
+    if (now - g.dev_ms > DRAG_CONFIRM_MS) {
+      // 一次只认一台被拖动的电机，认住之后 DRAG_HOLD_MS 内不换人
+      if (g.leader != 0) {
+        const float dev_leader = (g.leader == 1) ? dev_a : dev_b;
+        if ((now - g.leader_ms) > DRAG_HOLD_MS && dev_leader < DRAG_TOL) {
+          g.leader = 0;
+        }
+      } else if (dev_a > DRAG_TOL) {
+        g.leader = 1;
+        g.leader_ms = now;
+      } else if (dev_b > DRAG_TOL) {
+        g.leader = 2;
+        g.leader_ms = now;
+      }
+
+      bool fired = false;
+      if (g.leader == 1 && dev_a > DRAG_TOL) {
+        // A 被拖动：参考零点跟着 A 走
+        g.psi0_mech = mech_yaw - phi_A();
+        g.ref_a = motorA.angle;
+        phi_c = mech_yaw - g.psi0_mech;
+        g.leader_ms = now;
+        fired = true;
+      } else if (g.leader == 2 && dev_b > DRAG_TOL) {
+        // B 被拖动：反过来由 B 推零点
+        g.psi0_mech = mech_yaw - phi_B() / k;
+        g.ref_b = motorB.angle;
+        g.leader_ms = now;
+        fired = true;
+      }
+
+      if (fired) {
+        g.dev_ms = now;
+        g.dev_a = 0.0f;
+        g.dev_b = 0.0f;
+      }
     }
   }
 
   const float phi_c = mech_yaw - g.psi0_mech;
 
   g.ref_a = slew(g.ref_a, g.a0 + A_DIR * phi_c, REF_RATE * PID_DT);
-  g.ref_b = slew(g.ref_b, g.b0 + B_DIR * (k * phi_c), REF_RATE * PID_DT);
+  g.ref_b = slew(g.ref_b, g.b_ref0 + B_DIR * (k * phi_c), REF_RATE * PID_DT);
 
   pid_a.calc(g.ref_a, motorA.angle);
   pid_b.calc(g.ref_b, motorB.angle);

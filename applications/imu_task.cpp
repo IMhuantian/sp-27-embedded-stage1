@@ -3,8 +3,7 @@
 #include "tools/mahony/mahony.hpp"
 
 // bmi088 坐标系到机体系的旋转矩阵。
-// 这里按"C板横装、CAN 一侧朝前"填的，板子装法一变这个矩阵就得跟着改，
-// 不然解出来的 yaw/pitch/roll 全是错的。怎么定见 sp_middleware/io/bmi088/readme.md
+// 按"C 板横装、CAN 一侧朝前"填，装法变了要跟着改，怎么定见 sp_middleware/io/bmi088/readme.md
 const float r_ab[3][3] = {{0.0f, -1.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f}};
 
 // BMI088 走 SPI1: SCK=PB3 / MISO=PB4 / MOSI=PA7，片选 加速度计 PA4、陀螺仪 PB0

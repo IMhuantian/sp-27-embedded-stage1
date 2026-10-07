@@ -16,8 +16,6 @@ extern "C" void buzzer_task()
     osDelay(100);
   }
 
-  // 要放别的曲子的话，把一串 {频率, 时长} 排成表循环调用就行
-
   while (true) {
     osDelay(100);
   }

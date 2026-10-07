@@ -10,10 +10,8 @@ extern "C" void uart_task()
   remote.request();
 
   while (true) {
-    // remote.ch_lh / ch_lv / ch_rh / ch_rv / ch_lu   摇杆和拨轮，范围 [-1, 1]
-    // remote.sw_l / sw_r                             左右三位开关 DOWN / MID / UP
-    // remote.mouse / keys                            鼠标和键盘
-    // remote.is_alive(osKernelSysTick())             接收机在不在线
+    // remote 上的数据：ch_lh / ch_lv / ch_rh / ch_rv / ch_lu 是摇杆和拨轮，范围 [-1, 1]；
+    // sw_l / sw_r 是左右三位开关；is_alive() 看接收机在不在线
     osDelay(10);
   }
 }
@@ -29,7 +27,7 @@ extern "C" void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef * huart, uint16_t 
   }
 }
 
-// 收出错(比如噪声引起的帧错误)的时候也要重新挂 DMA，不然遥控器就一直收不到数据了
+// 收出错的时候重新挂 DMA
 extern "C" void HAL_UART_ErrorCallback(UART_HandleTypeDef * huart)
 {
   if (huart == &huart3) {
